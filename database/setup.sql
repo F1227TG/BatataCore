@@ -184,12 +184,12 @@ language sql
 stable
 security definer
 set search_path = public, pg_temp
-as $
+as $body$
     select exists (
         select 1 from public.profiles p
         where p.id = (select auth.uid()) and p.role = 'admin'
     );
-$;
+$body$;
 revoke all on function private.is_admin() from public;
 grant execute on function private.is_admin() to authenticated;
 
@@ -200,12 +200,12 @@ language sql
 stable
 security definer
 set search_path = public, pg_temp
-as $
+as $body$
     select exists (
         select 1 from public.profiles p
         where p.id = (select auth.uid()) and p.role in ('admin', 'organizador')
     );
-$;
+$body$;
 revoke all on function private.is_staff() from public;
 grant execute on function private.is_staff() to authenticated;
 
