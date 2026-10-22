@@ -177,22 +177,37 @@ create unique index if not exists uq_inscritos_ticket_code on public.inscritos(t
 -- Funções auxiliares e gatilhos
 -- ----------------------------------------------------------------
 
+-- Administrador: único papel autorizado a gerenciar níveis de acesso.
 create or replace function private.is_admin()
 returns boolean
 language sql
 stable
 security definer
 set search_path = public, pg_temp
-as $$
+as $
     select exists (
-        select 1
-        from public.profiles p
-        where p.id = (select auth.uid())
-          and p.role in ('admin','organizador')
+        select 1 from public.profiles p
+        where p.id = (select auth.uid()) and p.role = 'admin'
     );
-$$;
+$;
 revoke all on function private.is_admin() from public;
 grant execute on function private.is_admin() to authenticated;
+
+-- Equipe operacional: administra eventos, inscrições e check-in.
+create or replace function private.is_staff()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $
+    select exists (
+        select 1 from public.profiles p
+        where p.id = (select auth.uid()) and p.role in ('admin', 'organizador')
+    );
+$;
+revoke all on function private.is_staff() from public;
+grant execute on function private.is_staff() to authenticated;
 
 create or replace function private.touch_updated_at()
 returns trigger
@@ -435,7 +450,7 @@ begin
         raise exception 'Inscrição não encontrada.';
     end if;
 
-    if not private.is_admin()
+    if not private.is_staff()
        and (select auth.uid()) is distinct from v_inscricao.user_id then
         raise exception 'Você não tem permissão para cancelar esta inscrição.';
     end if;
@@ -473,7 +488,7 @@ as $$
 declare
     v_row public.inscritos%rowtype;
 begin
-    if not private.is_admin() then
+    if not private.is_staff() then
         raise exception 'Acesso administrativo necessário.';
     end if;
 
@@ -486,16 +501,21 @@ begin
         raise exception 'Ingresso não encontrado.';
     end if;
 
-    if v_row.status = 'cancelado' then
-        raise exception 'Esta inscrição foi cancelada.';
+    -- Somente inscrições confirmadas geram ingresso válido para entrada.
+    if v_row.status <> 'confirmado' then
+        raise exception 'Ingresso inválido: inscrição não confirmada.';
     end if;
 
-    if v_row.checked_in_at is null then
-        update public.inscritos
-           set checked_in_at = now(), status = 'confirmado'
-         where id = v_row.id
-         returning * into v_row;
+    -- A linha permanece bloqueada até o fim da transação; duas leituras
+    -- simultâneas não podem confirmar o mesmo ingresso.
+    if v_row.checked_in_at is not null then
+        raise exception 'Este ingresso já foi utilizado no check-in.';
     end if;
+
+    update public.inscritos
+       set checked_in_at = now()
+     where id = v_row.id
+     returning * into v_row;
 
     return query select v_row.id, v_row.nome, v_row.evento, v_row.checked_in_at;
 end;
@@ -517,7 +537,7 @@ begin
     select * into v_inscricao from public.inscritos where id = p_inscricao_id;
     if not found then raise exception 'Inscrição não encontrada.'; end if;
 
-    if not private.is_admin()
+    if not private.is_staff()
        and (select auth.uid()) is distinct from v_inscricao.user_id then
         raise exception 'Sem permissão para gerar este certificado.';
     end if;
@@ -616,32 +636,32 @@ using (status = 'publicado' and deleted_at is null);
 
 drop policy if exists eventos_admin_read on public.eventos;
 create policy eventos_admin_read on public.eventos for select to authenticated
-using (private.is_admin());
+using (private.is_staff());
 
 drop policy if exists eventos_admin_insert on public.eventos;
 create policy eventos_admin_insert on public.eventos for insert to authenticated
-with check (private.is_admin());
+with check (private.is_staff());
 
 drop policy if exists eventos_admin_update on public.eventos;
 create policy eventos_admin_update on public.eventos for update to authenticated
-using (private.is_admin()) with check (private.is_admin());
+using (private.is_staff()) with check (private.is_staff());
 
 drop policy if exists eventos_admin_delete on public.eventos;
 create policy eventos_admin_delete on public.eventos for delete to authenticated
-using (private.is_admin());
+using (private.is_staff());
 
 -- Inscrições: leitura própria ou administrativa. Criação apenas pela RPC.
 drop policy if exists inscritos_select_own on public.inscritos;
 create policy inscritos_select_own on public.inscritos for select to authenticated
-using ((select auth.uid()) = user_id or private.is_admin());
+using ((select auth.uid()) = user_id or private.is_staff());
 
 drop policy if exists inscritos_admin_update on public.inscritos;
 create policy inscritos_admin_update on public.inscritos for update to authenticated
-using (private.is_admin()) with check (private.is_admin());
+using (private.is_staff()) with check (private.is_staff());
 
 drop policy if exists inscritos_admin_delete on public.inscritos;
 create policy inscritos_admin_delete on public.inscritos for delete to authenticated
-using (private.is_admin());
+using (private.is_staff());
 
 -- Contatos
 drop policy if exists contatos_public_insert on public.contatos;
@@ -650,21 +670,21 @@ with check (user_id is null or user_id = (select auth.uid()));
 
 drop policy if exists contatos_select on public.contatos;
 create policy contatos_select on public.contatos for select to authenticated
-using (private.is_admin() or user_id = (select auth.uid()));
+using (private.is_staff() or user_id = (select auth.uid()));
 
 drop policy if exists contatos_admin_update on public.contatos;
 create policy contatos_admin_update on public.contatos for update to authenticated
-using (private.is_admin()) with check (private.is_admin());
+using (private.is_staff()) with check (private.is_staff());
 
 drop policy if exists contatos_admin_delete on public.contatos;
 create policy contatos_admin_delete on public.contatos for delete to authenticated
-using (private.is_admin());
+using (private.is_staff());
 
 -- Certificados
 drop policy if exists certificados_select_own on public.certificados;
 create policy certificados_select_own on public.certificados for select to authenticated
 using (
-    private.is_admin()
+    private.is_staff()
     or exists (
         select 1 from public.inscritos i
         where i.id = certificados.inscricao_id
@@ -675,11 +695,11 @@ using (
 -- Filas e auditoria apenas administrativas
 drop policy if exists email_queue_admin_all on public.email_queue;
 create policy email_queue_admin_all on public.email_queue for all to authenticated
-using (private.is_admin()) with check (private.is_admin());
+using (private.is_staff()) with check (private.is_staff());
 
 drop policy if exists audit_logs_admin_read on public.audit_logs;
 create policy audit_logs_admin_read on public.audit_logs for select to authenticated
-using (private.is_admin());
+using (private.is_staff());
 
 -- Privilégios de Data API. A RLS continua sendo a barreira de acesso por linha.
 revoke all on public.profiles, public.eventos, public.inscritos, public.contatos,
